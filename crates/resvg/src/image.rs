@@ -178,6 +178,51 @@ mod raster_images {
     ) -> Option<()> {
         let raster = decode_raster(image)?;
 
+        // -----------------------------------------------------------------
+        // 1.  Figure out how big the image will be in destination pixels.
+        //     For an affine transform | sx  kx  tx |
+        //                             | ky  sy  ty |
+        //     the column lengths give the approximate x/y scale factors.
+        // -----------------------------------------------------------------
+        let scale_x = (transform.sx * transform.sx + transform.ky * transform.ky).sqrt();
+        let scale_y = (transform.kx * transform.kx + transform.sy * transform.sy).sqrt();
+
+        let src_w = raster.width() as f32;
+        let src_h = raster.height() as f32;
+        let dst_w = (src_w * scale_x).ceil().max(1.0) as u32;
+        let dst_h = (src_h * scale_y).ceil().max(1.0) as u32;
+
+        // -----------------------------------------------------------------
+        // 2.  If we are down-scaling by more than 2×, pre-scale with a box
+        //     filter so tiny_skia's bicubic only ever sees ≤2× downscale.
+        // -----------------------------------------------------------------
+        let (raster, transform) =
+            if dst_w < src_w as u32 / 2 || dst_h < src_h as u32 / 2 &&
+                (rendering_mode == ImageRendering::OptimizeQuality ||
+                 rendering_mode == ImageRendering::Smooth ||
+                 rendering_mode == ImageRendering::HighQuality) {
+            // Keep the intermediate image 2× the final size so bicubic has
+            // enough samples to work with.
+            let target_w = (dst_w * 2).min(src_w as u32).max(1);
+            let target_h = (dst_h * 2).min(src_h as u32).max(1);
+
+            let scaled = box_filter_resize(&raster, target_w, target_h)?;
+
+            // The new image is smaller; we must scale local coordinates back
+            // up so the image still covers the same destination rectangle.
+            // T' = T * scale(src/target)  →  post_scale
+            let up_x = src_w / target_w as f32;
+            let up_y = src_h / target_h as f32;
+            let adjusted = transform.pre_scale(up_x, up_y);
+
+            (scaled, adjusted)
+        } else {
+            (raster, transform)
+        };
+
+        // -----------------------------------------------------------------
+        // 3.  Original tiny_skia rendering path (unchanged).
+        // -----------------------------------------------------------------
         let rect = tiny_skia::Size::from_wh(raster.width() as f32, raster.height() as f32)?
             .to_rect(0.0, 0.0)?;
 
@@ -203,5 +248,62 @@ mod raster_images {
         pixmap.fill_rect(rect, &paint, transform, None);
 
         Some(())
+    }
+
+    /// Box-filter resize. Averages all source pixels that fall inside each
+    /// destination pixel's footprint. This is exactly the low-pass filter
+    /// that a mipmap level-1 would apply.
+    fn box_filter_resize(
+        src: &tiny_skia::Pixmap,
+        dst_w: u32,
+        dst_h: u32,
+    ) -> Option<tiny_skia::Pixmap> {
+        let src_w = src.width();
+        let src_h = src.height();
+        let mut dst = tiny_skia::Pixmap::new(dst_w, dst_h)?;
+
+        let src_data = src.data();
+        let dst_data = dst.data_mut();
+
+        let x_ratio = src_w as f32 / dst_w as f32;
+        let y_ratio = src_h as f32 / dst_h as f32;
+
+        for dy in 0..dst_h {
+            let y0 = (dy as f32 * y_ratio) as u32;
+            let y1 = (((dy + 1) as f32 * y_ratio).ceil() as u32).min(src_h);
+
+            for dx in 0..dst_w {
+                let x0 = (dx as f32 * x_ratio) as u32;
+                let x1 = (((dx + 1) as f32 * x_ratio).ceil() as u32).min(src_w);
+
+                let mut r: u64 = 0;
+                let mut g: u64 = 0;
+                let mut b: u64 = 0;
+                let mut a: u64 = 0;
+                let mut count: u64 = 0;
+
+                for sy in y0..y1 {
+                    let row = (sy * src_w) as usize * 4;
+                    for sx in x0..x1 {
+                        let i = row + (sx as usize * 4);
+                        r += src_data[i]     as u64;
+                        g += src_data[i + 1] as u64;
+                        b += src_data[i + 2] as u64;
+                        a += src_data[i + 3] as u64;
+                        count += 1;
+                    }
+                }
+
+                let i = ((dy * dst_w + dx) as usize) * 4;
+                if count > 0 {
+                    dst_data[i]     = (r / count) as u8;
+                    dst_data[i + 1] = (g / count) as u8;
+                    dst_data[i + 2] = (b / count) as u8;
+                    dst_data[i + 3] = (a / count) as u8;
+                }
+            }
+        }
+
+        Some(dst)
     }
 }
