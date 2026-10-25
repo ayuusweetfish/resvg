@@ -19,8 +19,8 @@ use unicode_script::UnicodeScript;
 use crate::tree::{BBox, IsValidLength};
 use crate::{
     AlignmentBaseline, ApproxZeroUlps, BaselineShift, DominantBaseline, Fill, FillRule, Font,
-    FontResolver, GlyphId, LengthAdjust, PaintOrder, Path, ShapeRendering, Stroke, Text,
-    TextAnchor, TextChunk, TextDecorationStyle, TextFlow, TextPath, TextSpan, WritingMode,
+    FontFamily, FontResolver, GlyphId, LengthAdjust, PaintOrder, Path, ShapeRendering, Stroke,
+    Text, TextAnchor, TextChunk, TextDecorationStyle, TextFlow, TextPath, TextSpan, WritingMode,
 };
 
 /// A glyph that has already been positioned correctly.
@@ -946,6 +946,7 @@ fn process_chunk(
         let tmp_glyphs = shape_text(
             &chunk.text,
             font,
+            &span.font.families,
             span.small_caps,
             span.apply_kerning,
             &span.font.variations,
@@ -1359,6 +1360,7 @@ impl DatabaseExt for Database {
 pub(crate) fn shape_text(
     text: &str,
     font: Arc<ResolvedFont>,
+    font_families: &[FontFamily],
     small_caps: bool,
     apply_kerning: bool,
     variations: &[crate::FontVariation],
@@ -1395,9 +1397,24 @@ pub(crate) fn shape_text(
         }
 
         if let Some(c) = missing {
-            let fallback_font = match (resolver.select_fallback)(c, &used_fonts, fontdb)
-                .and_then(|id| fontdb.load_font(id, variations))
-            {
+            let fallback_id = fontdb
+                .face(font.id)
+                .and_then(|base_face| {
+                    font_families.iter().find_map(|family| {
+                        let query = fontdb::Query {
+                            families: &[to_fontdb_family(family)],
+                            weight: base_face.weight,
+                            stretch: base_face.stretch,
+                            style: base_face.style,
+                        };
+
+                        let id = fontdb.query(&query)?;
+                        (!used_fonts.contains(&id) && fontdb.has_char(id, c)).then_some(id)
+                    })
+                })
+                .or_else(|| (resolver.select_fallback)(c, &used_fonts, fontdb));
+
+            let fallback_font = match fallback_id.and_then(|id| fontdb.load_font(id, variations)) {
                 Some(v) => Arc::new(v),
                 None => break 'outer,
             };
@@ -1458,6 +1475,17 @@ pub(crate) fn shape_text(
     }
 
     glyphs
+}
+
+fn to_fontdb_family(family: &FontFamily) -> fontdb::Family<'_> {
+    match family {
+        FontFamily::Serif => fontdb::Family::Serif,
+        FontFamily::SansSerif => fontdb::Family::SansSerif,
+        FontFamily::Cursive => fontdb::Family::Cursive,
+        FontFamily::Fantasy => fontdb::Family::Fantasy,
+        FontFamily::Monospace => fontdb::Family::Monospace,
+        FontFamily::Named(s) => fontdb::Family::Name(s),
+    }
 }
 
 /// Converts a text into a list of glyph IDs.
