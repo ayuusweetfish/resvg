@@ -1384,6 +1384,8 @@ pub(crate) fn shape_text(
 
     // Loop until all glyphs become resolved or until no more fonts are left.
     'outer: loop {
+        let all_missing = glyphs.iter().all(|g| g.is_missing());
+
         let mut missing = None;
         for glyph in &glyphs {
             if glyph.is_missing() {
@@ -1414,8 +1416,8 @@ pub(crate) fn shape_text(
             .unwrap_or_default();
 
             let all_matched = fallback_glyphs.iter().all(|g| !g.is_missing());
-            if all_matched {
-                // Replace all glyphs when all of them were matched.
+            if all_missing && all_matched {
+                // Nothing to preserve, so use the fallback font for the entire text.
                 glyphs = fallback_glyphs;
                 break 'outer;
             }
